@@ -1,129 +1,155 @@
 # deployment/push_to_hf_space.py
 import os
+import shutil
 from pathlib import Path
 
 from huggingface_hub import HfApi, create_repo
 from huggingface_hub.utils import RepositoryNotFoundError
-from huggingface_hub.utils._http import HfHubHTTPError
+from huggingface_hub.utils import HfHubHTTPError
 
 
-SPACE_README_TEMPLATE = """---
-title: {title}
-emoji: {emoji}
-colorFrom: {colorFrom}
-colorTo: {colorTo}
+def _required_env(name: str) -> str:
+    v = os.getenv(name)
+    if not v:
+        raise EnvironmentError(f"{name} is missing. Set it as a GitHub Actions secret/env.")
+    return v
+
+
+def ensure_space_exists(api: HfApi, repo_id: str, token: str):
+    # repo_id must be like "username/space_name"
+    if "/" not in repo_id:
+        raise ValueError(f"HF_SPACE_REPO must be like 'username/space_name'. Got: {repo_id}")
+
+    try:
+        api.repo_info(repo_id=repo_id, repo_type="space")
+        print(f"[INFO] HF Space exists: {repo_id}")
+        return
+    except RepositoryNotFoundError:
+        print(f"[INFO] HF Space not found. Creating: {repo_id}")
+        try:
+            create_repo(
+                repo_id=repo_id,
+                repo_type="space",
+                token=token,
+                private=False,
+                space_sdk="streamlit",   # IMPORTANT
+            )
+            print(f"[INFO] Created Space: {repo_id}")
+        except HfHubHTTPError as e:
+            # If it already exists / race condition
+            if "409" in str(e):
+                print(f"[WARN] Space already exists (409). Continuing: {repo_id}")
+            else:
+                raise
+
+
+def build_readme(space_title: str) -> str:
+    # HF Spaces require this YAML header
+    return f"""---
+title: {space_title}
+emoji: 🚀
+colorFrom: blue
+colorTo: green
 sdk: streamlit
-sdk_version: "{sdk_version}"
+sdk_version: "1.36.0"
 app_file: app.py
 pinned: false
 ---
 
-# {title}
+# {space_title}
 
-Streamlit app for **VisitWithUs Tourism Prediction**.
-
-This Space is deployed automatically from GitHub Actions.
+Streamlit app deployed via GitHub Actions.
 """
 
 
-def ensure_space_exists(api: HfApi, repo_id: str, token: str):
-    try:
-        api.repo_info(repo_id=repo_id, repo_type="space")
-        print(f"[INFO] Space repo exists: {repo_id}")
-    except RepositoryNotFoundError:
-        print(f"[INFO] Space repo not found. Creating: {repo_id}")
-        create_repo(
-            repo_id=repo_id,
-            repo_type="space",
-            private=False,
-            token=token,
-            space_sdk="streamlit",  # IMPORTANT
-        )
-        print(f"[INFO] Space created: {repo_id}")
-    except HfHubHTTPError as e:
-        # Some org permissions / auth issues show up here
-        raise RuntimeError(
-            f"Failed checking/creating Space repo '{repo_id}'. "
-            f"Verify HF_SPACE_REPO and token permissions. Error: {e}"
-        )
-
-
-def write_readme(space_dir: Path):
-    readme_path = space_dir / "README.md"
-    content = SPACE_README_TEMPLATE.format(
-        title=os.getenv("HF_SPACE_TITLE", "VisitWithUs Tourism Predictor"),
-        emoji=os.getenv("HF_SPACE_EMOJI", "🧳"),
-        colorFrom=os.getenv("HF_SPACE_COLORFROM", "blue"),
-        colorTo=os.getenv("HF_SPACE_COLORTO", "green"),
-        sdk_version=os.getenv("HF_SPACE_SDK_VERSION", "1.36.0"),
-    )
-    readme_path.write_text(content, encoding="utf-8")
-    print("[INFO] README.md written with Spaces config front-matter.")
+def copy_if_exists(src: Path, dst: Path):
+    if src.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        print(f"[INFO] Copied: {src} -> {dst}")
+        return True
+    return False
 
 
 def main():
-    hf_token = os.getenv("HF_TOKEN")
-    hf_space_repo = os.getenv("HF_SPACE_REPO")  # ex: "sastrysagi/visitwithus-mlops-space"
+    hf_token = _required_env("HF_TOKEN")
+    hf_space_repo = _required_env("HF_SPACE_REPO")
 
-    if not hf_token:
-        raise EnvironmentError("HF_TOKEN is missing. Add it to GitHub Secrets.")
-    if not hf_space_repo:
-        raise EnvironmentError("HF_SPACE_REPO is missing. Add it to GitHub Secrets (e.g., username/space-name).")
+    # Optional (nice-to-have)
+    space_title = os.getenv("HF_SPACE_TITLE", "VisitWithUs - Wellness Package Purchase Predictor")
 
     api = HfApi(token=hf_token)
+    ensure_space_exists(api, repo_id=hf_space_repo, token=hf_token)
 
-    # Ensure the Space repo exists (fixes 404)
-    ensure_space_exists(api, hf_space_repo, hf_token)
+    # Prepare a clean deploy folder (what will be uploaded to Space)
+    deploy_dir = Path("deployment") / "_hf_space_bundle"
+    if deploy_dir.exists():
+        shutil.rmtree(deploy_dir)
+    deploy_dir.mkdir(parents=True, exist_ok=True)
 
-    # Stage files to a temp folder to upload cleanly
-    space_dir = Path("deployment") / "_hf_space_build"
-    space_dir.mkdir(parents=True, exist_ok=True)
-
-    # Required Space files
-    # - app.py must exist at repo root for Space (as per README frontmatter)
-    src_app = Path("app.py")
-    if not src_app.exists():
-        raise FileNotFoundError("app.py not found at repo root. Space needs app.py at root.")
-    (space_dir / "app.py").write_text(src_app.read_text(encoding="utf-8"), encoding="utf-8")
-
-    # requirements.txt (Space installs dependencies from this)
-    src_req = Path("requirements.txt")
-    if not src_req.exists():
-        raise FileNotFoundError("requirements.txt not found at repo root.")
-    (space_dir / "requirements.txt").write_text(src_req.read_text(encoding="utf-8"), encoding="utf-8")
-
-    # README with HF Spaces config (fixes “Missing configuration in README”)
-    write_readme(space_dir)
-
-    # Include model artifacts (produced by training job)
-    # Adjust if your model is saved differently.
-    artifacts_model_dir = Path("artifacts") / "model"
-    if artifacts_model_dir.exists():
-        # Copy entire folder
-        target_model_dir = space_dir / "artifacts" / "model"
-        target_model_dir.mkdir(parents=True, exist_ok=True)
-        for p in artifacts_model_dir.rglob("*"):
-            if p.is_file():
-                rel = p.relative_to(artifacts_model_dir)
-                out = target_model_dir / rel
-                out.parent.mkdir(parents=True, exist_ok=True)
-                out.write_bytes(p.read_bytes())
-        print("[INFO] Included model artifacts in Space upload.")
+    # 1) app.py must exist at repo root (as your workflow uses)
+    # If your app.py is at root, we copy it. If not, we try deployment/app.py.
+    root_app = Path("app.py")
+    alt_app = Path("deployment") / "app.py"
+    if root_app.exists():
+        shutil.copy2(root_app, deploy_dir / "app.py")
+    elif alt_app.exists():
+        shutil.copy2(alt_app, deploy_dir / "app.py")
     else:
-        print("[WARN] artifacts/model not found. Space will deploy but may not load model.")
+        raise FileNotFoundError("app.py not found at repo root or deployment/app.py")
 
-    # Upload to HF Space
-    print(f"[INFO] Uploading Space folder to: {hf_space_repo}")
+    # 2) requirements.txt
+    req = Path("requirements.txt")
+    if not req.exists():
+        raise FileNotFoundError("requirements.txt not found at repo root.")
+    shutil.copy2(req, deploy_dir / "requirements.txt")
+
+    # 3) README.md with HF Space config header
+    (deploy_dir / "README.md").write_text(build_readme(space_title), encoding="utf-8")
+
+    # 4) Ensure model file exists in Space at artifacts/model.joblib
+    # Your Streamlit error expects: /app/artifacts/model.joblib
+    # We will build exactly that path in the Space repo.
+    model_dst = deploy_dir / "artifacts" / "model.joblib"
+
+    # Common places where training may save the model:
+    candidates = [
+        Path("artifacts") / "model.joblib",
+        Path("artifacts") / "model" / "model.joblib",
+        Path("artifacts") / "model" / "best_model.joblib",
+        Path("model_building") / "artifacts" / "model.joblib",
+        Path("model_building") / "artifacts" / "model" / "model.joblib",
+    ]
+
+    found = False
+    for c in candidates:
+        if copy_if_exists(c, model_dst):
+            found = True
+            break
+
+    if not found:
+        raise FileNotFoundError(
+            "Could not find a trained model file to deploy. "
+            "Expected one of:\n" + "\n".join([str(c) for c in candidates]) +
+            "\n\nMake sure model-training job saved the model first."
+        )
+
+    # (Optional) If you have any extra artifacts needed by app.py (encoders/feature list), add here.
+    # Example:
+    # copy_if_exists(Path("artifacts") / "feature_schema.json", deploy_dir / "artifacts" / "feature_schema.json")
+
+    print(f"[INFO] Uploading Space bundle folder: {deploy_dir}")
+
     api.upload_folder(
-        folder_path=str(space_dir),
+        folder_path=str(deploy_dir),
         repo_id=hf_space_repo,
         repo_type="space",
-        commit_message="CI: deploy VisitWithUs Streamlit Space",
+        commit_message="Deploy Streamlit app + model via CI",
+        token=hf_token,
     )
 
-    print("[SUCCESS] Space deployed to Hugging Face:", hf_space_repo)
+    print(f"[SUCCESS] Deployed to HF Space: {hf_space_repo}")
 
 
 if __name__ == "__main__":
     main()
-
