@@ -1,0 +1,14 @@
+artifact_uri: file:///content/tourism_project/mlruns/834575563188021944/c3884143d3c34fe3aedea6ded05961a6/artifacts
+end_time: 1766899335644
+entry_point_name: ''
+experiment_id: '834575563188021944'
+lifecycle_stage: active
+run_id: c3884143d3c34fe3aedea6ded05961a6
+run_name: rf_gridsearch
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1766899322380
+status: 3
+tags: []
+user_id: root

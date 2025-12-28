@@ -1,0 +1,137 @@
+name: VisitWithUs MLOps Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  register-dataset:
+    name: Register Dataset (HF Dataset Repo)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -U huggingface_hub datasets pandas numpy
+
+      - name: Upload Dataset to Hugging Face Hub
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_USERNAME: ${{ secrets.HF_USERNAME }}
+          HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
+        run: |
+          python model_building/data_register.py
+
+  data-prep:
+    name: Data Validation + Preparation
+    needs: register-dataset
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -U huggingface_hub datasets pandas numpy scikit-learn
+
+      - name: Run Data Prep (includes validation + gender cleanup + negative checks)
+      # This should read from HF dataset repo OR from repo data/tourism.csv if present
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
+        run: |
+          python data/data_prep.py
+
+      - name: Upload prepared dataset artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: prepared-data
+          path: artifacts/prepared/
+
+  model-training:
+    name: Experimentation + Model Training (MLflow)
+    needs: data-prep
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -U mlflow scikit-learn pandas numpy joblib
+
+      - name: Download prepared dataset artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: prepared-data
+          path: artifacts/prepared/
+
+      # "Experimentation before deployment" happens here:
+      # this script should run multiple models/params, log to MLflow, pick best, and save final model
+      - name: Run Experiments + Train Best Model
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python model_building/train.py
+
+      - name: Upload model artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-artifacts
+          path: artifacts/model/
+
+  deploy-hosting:
+    name: Deploy to Hugging Face Space
+    needs: model-training
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -U huggingface_hub
+
+      - name: Download model artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: model-artifacts
+          path: artifacts/model/
+
+      - name: Push files to Hugging Face Space (Streamlit UI)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_SPACE_REPO: ${{ secrets.HF_SPACE_REPO }}
+        run: |
+          python deployment/push_to_hf_space.py
